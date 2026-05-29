@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Media generation agent — orchestrates DALL-E 3, Sora-2, and ElevenLabs
-via Claude tool-use to fulfil natural language creative briefs.
+Free media generation agent — uses Gemini 2.0 Flash (orchestration),
+FLUX.1-schnell via Hugging Face (images), minimax/video-01 via Replicate (video),
+Edge TTS (speech), and MusicGen via Hugging Face (sound effects).
 
 Usage:
-    python agent.py --prompt "Create a 4-second sunset video with ambient waves"
+    python agent.py --prompt "Create a video of a sunset with ambient waves"
 """
 
 import argparse
@@ -12,6 +13,8 @@ import json
 import os
 import sys
 
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,11 +23,11 @@ import tools.image_tool as image_tool
 import tools.video_tool as video_tool
 import tools.audio_tool as audio_tool
 import tools.combine_tool as combine_tool
-from utils import get_anthropic, is_dry_run
+from utils import is_dry_run
 
 os.makedirs("output", exist_ok=True)
 
-MODEL = "claude-sonnet-4-6"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 SYSTEM_PROMPT = """\
 You are a media generation agent. Given a user's creative brief, you plan and \
@@ -41,26 +44,16 @@ generate_sound_effect (ambient) + combine_video_audio.
 - Audio-only request → generate_tts or generate_sound_effect.
 
 ## Prompting tips
-- Expand the user's brief with vivid cinematic or artistic detail when calling \
-image/video tools — richer prompts produce better results.
-- For sound effects, describe the acoustic environment (e.g. "gentle ocean \
-waves at sunset with distant seagulls").
-- combine_video_audio stops at the shorter stream; match audio duration to \
-video duration when possible.
+- Expand the user's brief with vivid cinematic or artistic detail.
+- For sound effects, describe the acoustic environment precisely \
+(e.g. "gentle ocean waves crashing at sunset, seagulls in the distance").
+- combine_video_audio stops at the shorter stream; keep audio duration \
+close to video duration.
 
 ## After all tools complete
 Summarise what was created: list each output file path and a one-line \
 description of its contents.
 """
-
-# Tool definitions with prompt caching on the last entry
-TOOLS = [
-    image_tool.SCHEMA,
-    video_tool.SCHEMA,
-    audio_tool.TTS_SCHEMA,
-    audio_tool.SFX_SCHEMA,
-    {**combine_tool.SCHEMA, "cache_control": {"type": "ephemeral"}},
-]
 
 TOOL_MAP = {
     "generate_image": image_tool.generate_image,
@@ -71,87 +64,102 @@ TOOL_MAP = {
 }
 
 
-def run_agent(user_prompt: str) -> None:
-    client = get_anthropic()
-
-    system = [
-        {
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
+def _build_config() -> types.GenerateContentConfig:
+    """Build Gemini config with all tool declarations."""
+    schemas = [
+        image_tool.SCHEMA,
+        video_tool.SCHEMA,
+        audio_tool.TTS_SCHEMA,
+        audio_tool.SFX_SCHEMA,
+        combine_tool.SCHEMA,
     ]
+    tool = types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name=s["name"],
+                description=s["description"],
+                parameters=s["parameters"],
+            )
+            for s in schemas
+        ]
+    )
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=[tool],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
 
-    messages: list[dict] = [{"role": "user", "content": user_prompt}]
+
+def run_agent(user_prompt: str) -> None:
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    config = _build_config()
+
+    chat = client.chats.create(model=GEMINI_MODEL, config=config)
 
     if is_dry_run():
-        print("[DRY_RUN] API calls will be skipped — fixture files will be written.")
+        print("[DRY_RUN] Media API calls will be skipped — fixture files will be written.")
+
+    response = chat.send_message(user_prompt)
 
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=system,
-            tools=TOOLS,
-            messages=messages,
-        )
+        # Collect function calls from this response
+        fn_calls = [
+            p.function_call
+            for p in response.candidates[0].content.parts
+            if p.function_call and p.function_call.name
+        ]
 
-        # Serialise to plain dicts so the messages list stays JSON-safe across turns
-        messages.append(
-            {"role": "assistant", "content": [b.model_dump() for b in response.content]}
-        )
-
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if block.type == "text":
-                    print(block.text)
+        if not fn_calls:
+            # No more tool calls — print the final text and exit
+            try:
+                print(response.text)
+            except Exception:
+                pass
             break
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                print(f"[tool] {block.name}  args={json.dumps(block.input, ensure_ascii=False)}")
-                try:
-                    result = TOOL_MAP[block.name](**block.input)
-                    print(f"[tool] → {result}")
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps(result),
-                        }
+        # Execute each tool and send results back
+        fn_parts = []
+        for call in fn_calls:
+            print(f"[tool] {call.name}  args={dict(call.args)}")
+            try:
+                result = TOOL_MAP[call.name](**dict(call.args))
+                print(f"[tool] → {result}")
+                fn_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id=call.id,
+                            name=call.name,
+                            response={"result": json.dumps(result)},
+                        )
                     )
-                except Exception as exc:
-                    print(f"[tool] ERROR in {block.name}: {exc}", file=sys.stderr)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps({"error": str(exc)}),
-                            "is_error": True,
-                        }
+                )
+            except Exception as exc:
+                print(f"[tool] ERROR in {call.name}: {exc}", file=sys.stderr)
+                fn_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id=call.id,
+                            name=call.name,
+                            response={"error": str(exc)},
+                        )
                     )
-            messages.append({"role": "user", "content": tool_results})
-            continue
+                )
 
-        raise RuntimeError(f"Unexpected stop_reason: {response.stop_reason!r}")
+        response = chat.send_message(fn_parts)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Media generation agent powered by Claude + DALL-E 3 + Sora-2 + ElevenLabs"
+        description="Free media generation agent: Gemini + FLUX + Replicate + Edge TTS"
     )
     parser.add_argument(
         "--prompt",
         required=True,
-        help='Creative brief, e.g. "Make a 4-second sunset video with ambient waves"',
+        help='Creative brief, e.g. "Make a 5-second sunset video with wave sounds"',
     )
     args = parser.parse_args()
 
-    # Validate required keys here, not at import time, so the module is importable in tests
-    required_keys = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ELEVENLABS_API_KEY"]
+    required_keys = ["GEMINI_API_KEY", "HF_TOKEN", "REPLICATE_API_TOKEN"]
     missing = [k for k in required_keys if not os.environ.get(k)]
     if missing:
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}", file=sys.stderr)

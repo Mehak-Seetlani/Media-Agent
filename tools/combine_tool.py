@@ -1,10 +1,11 @@
 import subprocess
-from utils import output_path, check_ffmpeg, is_dry_run
+
+from utils import check_ffmpeg, is_dry_run
 
 SCHEMA = {
     "name": "combine_video_audio",
     "description": "Merge an MP4 video file and an MP3 audio file into a single MP4.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "video_path": {
@@ -30,7 +31,7 @@ def combine_video_audio(
     audio_path: str,
     output_path: str | None = None,
 ) -> dict:
-    # Resolve path before any branch that writes to it
+    # Resolve output path before any branch that writes to it
     if output_path is None:
         from utils import output_path as make_path
         output_path = make_path("combined", "mp4")
@@ -47,7 +48,7 @@ def combine_video_audio(
         "-i", video_path,
         "-i", audio_path,
         "-c:v", "copy",
-        "-c:a", "copy",   # MP3 passthrough — no re-encode needed
+        "-c:a", "copy",  # MP3 passthrough — no re-encode
         "-shortest",
         output_path,
     ]

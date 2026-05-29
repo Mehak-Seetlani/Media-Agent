@@ -30,6 +30,7 @@ def combine_video_audio(
     audio_path: str,
     output_path: str | None = None,
 ) -> dict:
+    # Resolve path before any branch that writes to it
     if output_path is None:
         from utils import output_path as make_path
         output_path = make_path("combined", "mp4")

@@ -16,14 +16,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Validate required keys before any API call
-_REQUIRED_KEYS = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ELEVENLABS_API_KEY"]
-_missing = [k for k in _REQUIRED_KEYS if not os.environ.get(k)]
-if _missing:
-    print(f"ERROR: Missing required environment variables: {', '.join(_missing)}", file=sys.stderr)
-    print("Copy .env.example to .env and fill in your keys.", file=sys.stderr)
-    sys.exit(1)
-
 import tools.image_tool as image_tool
 import tools.video_tool as video_tool
 import tools.audio_tool as audio_tool
@@ -104,7 +96,10 @@ def run_agent(user_prompt: str) -> None:
             messages=messages,
         )
 
-        messages.append({"role": "assistant", "content": response.content})
+        # Serialise to plain dicts so the messages list stays JSON-safe across turns
+        messages.append(
+            {"role": "assistant", "content": [b.model_dump() for b in response.content]}
+        )
 
         if response.stop_reason == "end_turn":
             for block in response.content:
@@ -154,6 +149,15 @@ def main() -> None:
         help='Creative brief, e.g. "Make a 4-second sunset video with ambient waves"',
     )
     args = parser.parse_args()
+
+    # Validate required keys here, not at import time, so the module is importable in tests
+    required_keys = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ELEVENLABS_API_KEY"]
+    missing = [k for k in required_keys if not os.environ.get(k)]
+    if missing:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
+        print("Copy .env.example to .env and fill in your keys.", file=sys.stderr)
+        sys.exit(1)
+
     run_agent(args.prompt)
 
 
